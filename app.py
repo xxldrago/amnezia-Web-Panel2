@@ -27,7 +27,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from fastapi import FastAPI, Request, Query, UploadFile, File
 from starlette.middleware.sessions import SessionMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List, Dict
 import uvicorn
 import httpx
@@ -43,6 +43,13 @@ from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
 from managers.backup_manager import BackupManager
 import telegram_bot as tg_bot
+
+from connection_service import (
+    ConnectionService,
+    DEFAULT_SELF_SERVICE_SETTINGS,
+    RateLimitError,
+    SelfServiceError,
+)
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -196,12 +203,29 @@ def load_data():
         'last_created_count': 0,
         'last_error': None
     })
+    self_service = data['settings'].setdefault('self_service', dict(DEFAULT_SELF_SERVICE_SETTINGS))
+    for key, value in DEFAULT_SELF_SERVICE_SETTINGS.items():
+        self_service.setdefault(key, value)
+    for server in data.get('servers', []):
+        server.setdefault('self_service_enabled', False)
     return data
 
 
 def save_data(data):
-    with open(DATA_FILE, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+    data_dir = os.path.dirname(DATA_FILE) or '.'
+    fd, tmp_path = tempfile.mkstemp(prefix='.data-', suffix='.json', dir=data_dir)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, DATA_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 async def save_data_async(data):
@@ -1035,6 +1059,26 @@ def generate_vpn_link(config_text):
     return f"vpn://{b64}"
 
 
+self_service_connections = ConnectionService(
+    load_data=load_data,
+    save_data=save_data,
+    data_lock=DATA_LOCK,
+    get_ssh=get_ssh,
+    get_protocol_manager=get_protocol_manager,
+    manager_call=_manager_call,
+    generate_vpn_link=generate_vpn_link,
+)
+
+
+def _self_service_error_response(exc):
+    if isinstance(exc, RateLimitError):
+        return JSONResponse({'error': str(exc)}, status_code=429)
+    if isinstance(exc, SelfServiceError):
+        return JSONResponse({'error': str(exc)}, status_code=exc.status_code)
+    logger.exception("Unexpected self-service error")
+    return JSONResponse({'error': 'Internal server error'}, status_code=500)
+
+
 # ===================== API tokens =====================
 
 API_TOKEN_PREFIX = 'awp_'  # "Amnezia Web Panel" — makes tokens visually distinct in logs / configs
@@ -1456,6 +1500,7 @@ class EditServerRequest(BaseModel):
     # fields can be omitted to keep current auth unchanged.
     password: Optional[str] = None
     private_key: Optional[str] = None
+    self_service_enabled: Optional[bool] = None
 
 
 class ReorderServersRequest(BaseModel):
@@ -1618,6 +1663,22 @@ class AutoBackupSettings(BaseModel):
     interval_hours: int = 24
 
 
+class SelfServiceSettings(BaseModel):
+    enabled: bool = False
+    web_enabled: bool = True
+    telegram_enabled: bool = True
+    max_connections_per_user: int = Field(5, ge=1, le=100)
+    rate_limit_count: int = Field(3, ge=1, le=100)
+    rate_limit_window_seconds: int = Field(60, ge=1, le=86400)
+    allowed_protocols: List[str] = Field(default_factory=lambda: ['awg', 'awg2'])
+
+
+class SelfServiceConnectionRequest(BaseModel):
+    server_id: int
+    protocol: str = 'awg'
+    name: str = 'VPN Connection'
+
+
 
 
 class UpdateUserRequest(BaseModel):
@@ -1638,10 +1699,22 @@ class SaveSettingsRequest(BaseModel):
     telegram: TelegramSettings
     ssl: SSLSettings
     auto_backup: AutoBackupSettings = AutoBackupSettings()
+    self_service: SelfServiceSettings = SelfServiceSettings()
 
 
 class ToggleUserRequest(BaseModel):
     enabled: bool
+
+
+def _normalize_telegram_id(value):
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if not normalized.isdigit():
+        raise ValueError('Telegram ID must be numeric')
+    return normalized
 
 
 class AddUserConnectionRequest(BaseModel):
@@ -1760,7 +1833,7 @@ async def startup():
     tg_cfg = data.get('settings', {}).get('telegram', {})
     if tg_cfg.get('enabled') and tg_cfg.get('token'):
         logger.info("Starting Telegram bot from saved settings...")
-        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link, save_data)
+        tg_bot.launch_bot(tg_cfg['token'], load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections)
 
 
 def _auto_backup_due(auto_backup: dict, now: Optional[datetime] = None) -> bool:
@@ -2245,6 +2318,8 @@ async def api_edit_server(request: Request, server_id: int, req: EditServerReque
         server['password'] = new_pass
         server['private_key'] = new_key
         server['server_info'] = server_info
+        if req.self_service_enabled is not None:
+            server['self_service_enabled'] = bool(req.self_service_enabled)
         save_data(data)
         return {'status': 'success', 'server_info': server_info}
     except Exception as e:
@@ -3418,6 +3493,10 @@ async def api_add_user(request: Request, req: AddUserRequest):
     try:
         data = load_data()
         lang = request.cookies.get('lang', 'ru')
+        try:
+            telegram_id = _normalize_telegram_id(req.telegramId)
+        except ValueError as exc:
+            return JSONResponse({'error': str(exc)}, status_code=400)
         # Check duplicate
         if any(u['username'] == req.username for u in data.get('users', [])):
             return JSONResponse({'error': _t('user_exists', lang)}, status_code=400)
@@ -3428,7 +3507,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
             'username': req.username,
             'password_hash': hash_password(req.password),
             'role': req.role,
-            'telegramId': req.telegramId,
+            'telegramId': telegram_id,
             'email': req.email,
             'description': req.description,
             'traffic_limit': int(req.traffic_limit * 1024**3) if req.traffic_limit else 0,
@@ -3506,7 +3585,11 @@ async def api_update_user(request: Request, user_id: str, req: UpdateUserRequest
         if not user:
             return JSONResponse({'error': 'User not found'}, status_code=404)
             
-        if req.telegramId is not None: user['telegramId'] = req.telegramId
+        if req.telegramId is not None:
+            try:
+                user['telegramId'] = _normalize_telegram_id(req.telegramId)
+            except ValueError as exc:
+                return JSONResponse({'error': str(exc)}, status_code=400)
         if req.email is not None: user['email'] = req.email
         if req.description is not None: user['description'] = req.description
         if req.traffic_limit is not None: 
@@ -3696,6 +3779,41 @@ async def api_my_connections(request: Request):
         else:
             c['server_name'] = 'Unknown'
     return {'connections': conns}
+
+
+@app.get('/api/my/connections/options', tags=["Self-service"])
+async def api_my_connection_options(request: Request):
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await self_service_connections.get_self_service_options(user['id'], 'web')
+    except Exception as exc:
+        return _self_service_error_response(exc)
+
+
+@app.post('/api/my/connections/add', tags=["Self-service"])
+async def api_my_connection_add(request: Request, payload: SelfServiceConnectionRequest):
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await self_service_connections.create_user_connection(
+            user['id'], payload.server_id, payload.protocol, payload.name, 'web'
+        )
+    except Exception as exc:
+        return _self_service_error_response(exc)
+
+
+@app.post('/api/my/connections/{connection_id}/delete', tags=["Self-service"])
+async def api_my_connection_delete(request: Request, connection_id: str):
+    user = get_current_user(request)
+    if not user:
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        return await self_service_connections.delete_user_connection(user['id'], connection_id, 'web')
+    except Exception as exc:
+        return _self_service_error_response(exc)
 
 
 @app.post('/api/users/{user_id}/share/setup', tags=["Users"])
@@ -3985,6 +4103,9 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
         'last_created_count': old_auto_backup.get('last_created_count', 0),
         'last_error': old_auto_backup.get('last_error')
     }
+    self_service = payload.self_service.dict()
+    self_service['allowed_protocols'] = [p for p in self_service.get('allowed_protocols', []) if p in ('awg', 'awg2')]
+    settings['self_service'] = self_service
     save_data(data)
     logger.info("Settings saved (including captcha, telegram and auto backup)")
 
@@ -3993,7 +4114,7 @@ async def save_settings(request: Request, payload: SaveSettingsRequest):
     if tg_cfg.enabled and tg_cfg.token:
         if not tg_bot.is_running():
             logger.info("Starting Telegram bot (settings save)...")
-            tg_bot.launch_bot(tg_cfg.token, load_data, generate_vpn_link, save_data)
+            tg_bot.launch_bot(tg_cfg.token, load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections)
     else:
         if tg_bot.is_running():
             logger.info("Stopping Telegram bot (settings save)...")
@@ -4020,7 +4141,7 @@ async def api_telegram_toggle(request: Request):
         save_data(data)
         return {'status': 'stopped', 'bot_running': False}
     else:
-        tg_bot.launch_bot(token, load_data, generate_vpn_link, save_data)
+        tg_bot.launch_bot(token, load_data, generate_vpn_link, save_data, self_service_svc=self_service_connections)
         tg_cfg['enabled'] = True
         data['settings']['telegram'] = tg_cfg
         save_data(data)

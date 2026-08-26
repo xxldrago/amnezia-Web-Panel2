@@ -103,6 +103,8 @@ Configuration panel for system parameters and preferences:
     *   **Backup / Migrate protocols (Alpha)**: Move protocol configurations between nodes for maintenance, recovery, and migration workflows.
 *   **🔗 Public Sharing**:
     *   Generate password-protected links for users to download their configurations without panel access.
+*   **🔐 Self-Service Security**:
+    *   Self-service users receive VPN peer access to the configured VPN subnet. Keep the panel/admin UI off user-reachable VPN routes unless intended, or constrain access with firewall rules and client `AllowedIPs`.
 *   **🌍 One-click Public Tunnels**:
     *   Open the local panel to the internet from `/settings` using **Cloudflare Quick Tunnel** or **ngrok**.
     *   Shows the local server URL, installation state, running state, and issued public HTTPS URLs directly in the UI.
@@ -279,4 +281,3 @@ This project is licensed under the **GNU General Public License v3.0** - see the
 
 ---
 *Built with ❤️ for the Amnezia community.*
-
