@@ -435,12 +435,27 @@ fi
         return True
 
     def setup_firewall(self):
-        """Setup host firewall (mirrors setup_host_firewall.sh)."""
+        """Setup host firewall (mirrors setup_host_firewall.sh).
+
+        Also raises net.netfilter.nf_conntrack_max: the default on small
+        VMs can be as low as ~7680 entries, and every client flow through
+        the NAT consumes one entry. A full conntrack table makes the
+        kernel silently drop packets ("nf_conntrack: table full"), which
+        users see as random connection freezes. 262144 is a safe value
+        for a VPN gateway; persisted via /etc/sysctl.d.
+        """
         script = """
 sysctl -w net.ipv4.ip_forward=1
 sysctl -w net.ipv6.conf.all.forwarding=1 2>/dev/null || true
 iptables -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null || iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
 iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-USER 2>/dev/null
+if [ -f /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    cur=$(cat /proc/sys/net/netfilter/nf_conntrack_max)
+    if [ "$cur" -lt 262144 ] 2>/dev/null; then
+        printf '%s\n' 'net.netfilter.nf_conntrack_max = 262144' > /etc/sysctl.d/98-awp-conntrack.conf
+        sysctl -w net.netfilter.nf_conntrack_max=262144
+    fi
+fi
 """
         self.ssh.run_sudo_script(script)
         return True
