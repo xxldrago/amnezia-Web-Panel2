@@ -1702,6 +1702,12 @@ a:hover {
     color: #22c55e;
 }
 
+.client-ip {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
 .traffic-down,
 .traffic-up {
     min-width: 96px;

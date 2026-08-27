@@ -2066,6 +2066,10 @@
                 const assignedUser = client.assigned_user || '';
                 client._online = false; // reset each render; set by the handshake badge below
 
+                // Peer internal IP shown next to the name
+                const peerIp = userData.clientIp || (userData.allowedIps || '').match(/(\d+\.\d+\.\d+\.\d+)/)?.[1] || '';
+                const ipHtml = peerIp ? ` <span class="client-ip">${escapeHtml(peerIp)}</span>` : '';
+
                 let metaHtml = '';
                 if (assignedUser) metaHtml += `<span class="badge badge-info" style="font-size:0.65rem;">👤 ${escapeHtml(assignedUser)}</span>`;
                 if (created) metaHtml += `<span>📅 ${formatDate(created)}</span>`;
@@ -2098,7 +2102,7 @@
                         <div class="client-info">
                             <div class="client-avatar${client._online ? ' avatar-online' : ''}">${initial}</div>
                             <div>
-                                <div class="client-name">${escapeHtml(name)}</div>
+                                <div class="client-name">${escapeHtml(name)}${ipHtml}</div>
                                 <div class="client-meta">${metaHtml || `<span class="text-muted">${_('no_data')}</span>`}</div>
                             </div>
                         </div>
@@ -2242,7 +2246,10 @@
     function startRenameConnection(clientId, btn) {
         const item = btn.closest('.client-item');
         const nameEl = item.querySelector('.client-name');
-        const oldName = nameEl.textContent;
+        // .client-name also contains the .client-ip span; edit the name only
+        const clone = nameEl.cloneNode(true);
+        clone.querySelectorAll('.client-ip').forEach(el => el.remove());
+        const oldName = clone.textContent.trim();
         nameEl.innerHTML = `
             <span class="rename-editor" style="display:inline-flex;gap:4px;align-items:center;">
                 <input type="text" class="form-input" style="padding:2px 8px;font-size:0.85rem;width:160px;height:auto;" value="${escapeHtml(oldName)}">
