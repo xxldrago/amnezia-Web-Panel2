@@ -2038,6 +2038,16 @@
             return;
         }
 
+        // Skip poll re-renders while the rename editor is open — a full innerHTML
+        // rebuild would destroy the input mid-typing
+        if (isPoll && document.querySelector('#connectionsListInner .rename-editor')) {
+            clearTimeout(window.connPollTimer);
+            if (document.getElementById('connectionsSection').style.display !== 'none') {
+                window.connPollTimer = setTimeout(function() { loadConnections(true); }, 5000);
+            }
+            return;
+        }
+
         if (window.connLoading) return; // don't stack overlapping polls
         window.connLoading = true;
         if (!isPoll) loading.style.display = ''; // silent refresh on polls
@@ -2077,11 +2087,16 @@
                     if (userData.quota) metaHtml += `<span class="badge" style="font-size:0.65rem;">Quota: ${formatBytes(userData.quota)}</span>`;
                     if (userData.expiry) metaHtml += `<span class="badge" style="font-size:0.65rem;">⌛ ${formatDate(userData.expiry)}</span>`;
                 } else {
-                    if (handshake) metaHtml += `<span>🤝 ${handshake}</span>`;
+                    const hsSec = parseHandshakeAgo(handshake);
+                    const isOnline = hsSec !== null && hsSec < 180;
+                    if (handshake) metaHtml += `<span class="meta-handshake${isOnline ? ' meta-online' : ''}">🤝 ${formatHandshakeCompact(handshake)}</span>`;
                     // awg show reports transfer from the SERVER perspective:
                     // "received" = client upload, "sent" = client download.
                     if (sent) metaHtml += `<span class="traffic-badge traffic-down">↓ ${sent}</span>`;
                     if (received) metaHtml += `<span class="traffic-badge traffic-up">↑ ${received}</span>`;
+                    const rates = computeRates(client.clientId, userData);
+                    if (rates) metaHtml += `<span class="traffic-badge speed-badge${rates.active ? ' speed-active' : ''}">↓${formatBytes(Math.round(rates.rx))}/s ↑${formatBytes(Math.round(rates.tx))}/s</span>`;
+                    if (isOnline) client._online = true;
                 }
 
                 if (!enabled) metaHtml += `<span class="badge badge-danger" style="font-size:0.65rem">${_('stop')}</span>`;
