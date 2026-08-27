@@ -445,6 +445,78 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         self.ssh.run_sudo_script(script)
         return True
 
+    def setup_host_tuning(self):
+        """Enable BBR congestion control on the host (with persistence).
+
+        BBR is available in all kernels >= 4.9 (any modern Debian/Ubuntu).
+        If the tcp_bbr module is not loaded, load it and persist across
+        reboots. Falls back silently when the kernel has no BBR support.
+        BBR significantly outperforms cubic on lossy paths, which VPN
+        tunnels often traverse.
+        """
+        script = """
+set -e
+if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    modprobe tcp_bbr 2>/dev/null || true
+fi
+if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    echo tcp_bbr > /etc/modules-load.d/awp-bbr.conf
+    printf '%s\\n' \\
+        'net.core.default_qdisc = fq' \\
+        'net.ipv4.tcp_congestion_control = bbr' \\
+        > /etc/sysctl.d/99-awp-bbr.conf
+    sysctl -w net.core.default_qdisc=fq
+    sysctl -w net.ipv4.tcp_congestion_control=bbr
+fi
+"""
+        try:
+            self.ssh.run_sudo_script(script)
+        except Exception as err:
+            logger.warning(f"setup_host_tuning warning: {err}")
+        return True
+
+    def get_host_tuning(self):
+        """Read live network-tuning state for the whole server (host + all
+        AWG containers). Used by the server-level "Host tuning" modal.
+        """
+        script = """
+echo "HOST_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+echo "HOST_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+echo "HOST_CONNTRACK=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)"
+echo "HOST_CONNTRACK_COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)"
+echo "HOST_BACKLOG=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null)"
+echo "HOST_SOMAXCONN=$(sysctl -n net.core.somaxconn 2>/dev/null)"
+for c in $(docker ps -a --format '{{.Names}}' | grep '^amnezia-awg' | sort); do
+  echo "CT_NAME=$c"
+  if docker ps --format '{{.Names}}' | grep -qx "$c"; then
+    echo "CT_RUNNING=1"
+    docker exec "$c" sh -c 'for p in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing; do echo "CTK_$p=$(sysctl -n $p 2>/dev/null)"; done; echo "CTK_nofile=$(ulimit -n)"' 2>/dev/null
+  else
+    echo "CT_RUNNING=0"
+  fi
+done
+"""
+        out, err, code = self.ssh.run_sudo_command(script, timeout=60)
+        info = {'host': {}, 'containers': []}
+        if code != 0 or not out:
+            return info
+        current = None
+        for line in out.splitlines():
+            if '=' not in line:
+                continue
+            key, _, val = line.partition('=')
+            key, val = key.strip(), val.strip()
+            if key.startswith('HOST_'):
+                info['host'][key[5:].lower()] = val
+            elif key == 'CT_NAME':
+                current = {'name': val, 'running': False, 'ct': {}}
+                info['containers'].append(current)
+            elif key == 'CT_RUNNING' and current is not None:
+                current['running'] = val == '1'
+            elif key.startswith('CTK_') and current is not None:
+                current['ct'][key[4:]] = val
+        return info
+
     def install_protocol(self, protocol_type, port=None, awg_params=None):
         """
         Full installation of AWG or AWG-Legacy protocol.
@@ -504,8 +576,32 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             f"\n"
             f"RUN mkdir -p /opt/amnezia\n"
             f'RUN echo "#!/bin/bash" > /opt/amnezia/start.sh && '
+            f'echo "sysctl -p /etc/sysctl.conf 2>/dev/null || true" >> /opt/amnezia/start.sh && '
             f'echo "tail -f /dev/null" >> /opt/amnezia/start.sh\n'
             f"RUN chmod a+x /opt/amnezia/start.sh\n"
+            f"\n"
+            f"# Network tuning (mirrors AmneziaVPN container tuning)\n"
+            f"RUN printf '%s\\n' \\\n"
+            f"'fs.file-max = 51200' \\\n"
+            f"'net.core.rmem_max = 67108864' \\\n"
+            f"'net.core.wmem_max = 67108864' \\\n"
+            f"'net.core.netdev_max_backlog = 250000' \\\n"
+            f"'net.core.somaxconn = 4096' \\\n"
+            f"'net.ipv4.tcp_syncookies = 1' \\\n"
+            f"'net.ipv4.tcp_tw_reuse = 1' \\\n"
+            f"'net.ipv4.tcp_fin_timeout = 30' \\\n"
+            f"'net.ipv4.tcp_keepalive_time = 1200' \\\n"
+            f"'net.ipv4.ip_local_port_range = 10000 65000' \\\n"
+            f"'net.ipv4.tcp_max_syn_backlog = 8192' \\\n"
+            f"'net.ipv4.tcp_max_tw_buckets = 5000' \\\n"
+            f"'net.ipv4.tcp_fastopen = 3' \\\n"
+            f"'net.ipv4.tcp_mem = 25600 51200 102400' \\\n"
+            f"'net.ipv4.tcp_rmem = 4096 87380 67108864' \\\n"
+            f"'net.ipv4.tcp_wmem = 4096 65536 67108864' \\\n"
+            f"'net.ipv4.tcp_mtu_probing = 1' \\\n"
+            f" >> /etc/sysctl.conf && \\\n"
+            f"mkdir -p /etc/security && \\\n"
+            f"printf '%s\\n' '* soft nofile 51200' '* hard nofile 51200' >> /etc/security/limits.conf\n"
             f"\n"
             f'ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]\n'
         )
@@ -530,6 +626,7 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
 -p {port}:{port}/udp \
 -v /lib/modules:/lib/modules \
 --sysctl="net.ipv4.conf.all.src_valid_mark=1" \
+--ulimit nofile=51200:51200 \
 --name {container_name} \
 {container_name}"""
 
@@ -565,6 +662,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         results.append("Setting up firewall...")
         self.setup_firewall()
         results.append("Firewall configured")
+
+        # Step 9: Host network tuning (BBR)
+        results.append("Applying host network tuning (BBR)...")
+        self.setup_host_tuning()
+        results.append("Host network tuning applied")
 
         return {
             'status': 'success',
@@ -704,6 +806,9 @@ EOF
 
         start_script = f"""#!/bin/bash
 echo "Container startup"
+
+# Apply container network tuning (see Dockerfile)
+sysctl -p /etc/sysctl.conf 2>/dev/null || true
 
 # Read subnet from server config dynamically (IPv4 part of the Address line)
 SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ')
@@ -857,6 +962,9 @@ tail -f /dev/null
         quick_bin = self._quick_binary(protocol_type)
         start_script = f"""#!/bin/bash
 echo "Container startup"
+
+# Apply container network tuning (see Dockerfile)
+sysctl -p /etc/sysctl.conf 2>/dev/null || true
 
 # Read subnet from server config dynamically (IPv4 part of the Address line)
 SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ')

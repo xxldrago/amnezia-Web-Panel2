@@ -403,5 +403,6 @@
   "reset_traffic": "بازنشانی ترافیک",
   "resetting": "در حال بازنشانی...",
   "reset_traffic_confirm": "ترافیک فعلی این کاربر بازنشانی شود؟ آمار کل حفظ میشود.",
-  "traffic_reset_success": "ترافیک بازنشانی شد"
+  "traffic_reset_success": "ترافیک بازنشانی شد",
+  "host_tuning": "تنظیمات میزبان"
 }

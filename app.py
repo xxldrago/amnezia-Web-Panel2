@@ -2991,6 +2991,27 @@ async def api_server_config(request: Request, server_id: int, req: ProtocolReque
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+@app.post('/api/servers/{server_id}/host_tuning', tags=["Protocols"])
+async def api_host_tuning(request: Request, server_id: int):
+    """Server-level network tuning summary (host sysctls + AWG containers)."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        mgr = AWGManager(ssh)
+        info = mgr.get_host_tuning()
+        ssh.disconnect()
+        return info
+    except Exception as e:
+        logger.exception("Error getting host tuning info")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
 @app.post('/api/servers/{server_id}/server_config/save', tags=["Protocols"])
 async def api_server_config_save(request: Request, server_id: int, req: ServerConfigSaveRequest):
     """Save the raw server-side WireGuard/Xray configuration and apply changes."""
