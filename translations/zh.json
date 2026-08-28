@@ -95,6 +95,8 @@
   "connection_name_placeholder": "例如: iPhone, 笔记本电脑",
   "assign_to_user": "分配给用户 (可选)",
   "no_assign": "— 不分配 —",
+  "select_search_placeholder": "搜索...",
+  "select_search_empty": "无匹配项",
   "create": "创建",
   "creating": "创建中...",
   "connection_created": "连接 \"{}\" 已创建",

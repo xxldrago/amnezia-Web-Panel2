@@ -811,7 +811,9 @@
 
         <div class="form-group">
             <label class="form-label">{{ _('assign_to_user') }}</label>
-            <select class="form-select" id="connectionUserId">
+            <select class="form-select" id="connectionUserId" data-searchable
+                data-search-placeholder="{{ _('select_search_placeholder') }}"
+                data-search-empty="{{ _('select_search_empty') }}">
                 <option value="">{{ _('no_assign') }}</option>
                 {% for u in users %}
                 <option value="{{ u.id }}">{{ u.username }} ({{ u.role }})</option>

@@ -96,6 +96,8 @@
   "connection_name_placeholder": "Например: iPhone, Laptop",
   "assign_to_user": "Назначить пользователю (опционально)",
   "no_assign": "— Без привязки —",
+  "select_search_placeholder": "Поиск...",
+  "select_search_empty": "Ничего не найдено",
   "create": "Создать",
   "creating": "Создание...",
   "connection_created": "Подключение \"{}\" создано",

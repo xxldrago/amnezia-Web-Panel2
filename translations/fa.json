@@ -95,6 +95,8 @@
   "connection_name_placeholder": "مثال: iPhone, Laptop",
   "assign_to_user": "تخصیص به کاربر (اختیاری)",
   "no_assign": "— بدون تخصیص —",
+  "select_search_placeholder": "جستجو...",
+  "select_search_empty": "موردی یافت نشد",
   "create": "ایجاد",
   "creating": "در حال ایجاد...",
   "connection_created": "اتصال \"{}\" ایجاد شد",

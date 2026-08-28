@@ -96,6 +96,8 @@
   "connection_name_placeholder": "Example: iPhone, Laptop",
   "assign_to_user": "Assign to user (optional)",
   "no_assign": "— No assignment —",
+  "select_search_placeholder": "Search...",
+  "select_search_empty": "No matches",
   "create": "Create",
   "creating": "Creating...",
   "connection_created": "Connection \"{}\" created",
