@@ -21,6 +21,13 @@ from cryptography.hazmat.primitives import serialization
 
 logger = logging.getLogger(__name__)
 
+# Dual-stack behaviour for AWG tunnels, overridable like the panel's other
+# environment knobs (SECRET_KEY, TUNNEL_BIN_DIR): "auto" probes the server,
+# "off" keeps every tunnel IPv4-only, "on" forces dual-stack.
+AWG_IPV6_ENV = 'AWG_IPV6'
+IPV6_FORCE_OFF = ('off', 'false', '0', 'no', 'disable', 'disabled')
+IPV6_FORCE_ON = ('on', 'true', '1', 'yes', 'force', 'forced')
+
 # Default AWG parameters (from protocols_defs.h)
 AWG_DEFAULTS = {
     'port': '55424',
@@ -357,13 +364,51 @@ class AWGManager:
         prefix = gateway.rsplit(':', 1)[0] + ':'
         return f"{prefix}{octet:x}"
 
-    def _detect_server_ipv6(self):
-        """Check if the host has working IPv6 (default route or any global address)."""
+    def _detect_server_ipv6(self, protocol_type=None):
+        """Decide whether the tunnel should be dual-stack.
+
+        The AWG_IPV6 environment variable forces the answer ("off" / "on");
+        in the default "auto" mode the server is probed.
+
+        Auto-detection requires IPv6 to work end-to-end: a global address on
+        the host *and* a default IPv6 route inside the protocol container.
+        Docker networks are IPv4-only unless the daemon is explicitly
+        configured for IPv6, so checking the host alone can enable a
+        dual-stack tunnel whose NAT66 has nowhere to forward. Clients then
+        receive an IPv6 address, an IPv6 DNS server and ::/0 with no route
+        out, which blackholes traffic on IPv6-preferring clients (notably
+        macOS) even though the host's own IPv6 is fine.
+        """
+        mode = os.environ.get(AWG_IPV6_ENV, 'auto').strip().lower()
+        if mode in IPV6_FORCE_OFF:
+            logger.info("%s=%s, keeping the tunnel IPv4-only", AWG_IPV6_ENV, mode)
+            return False
+        if mode in IPV6_FORCE_ON:
+            logger.info("%s=%s, forcing a dual-stack tunnel", AWG_IPV6_ENV, mode)
+            return True
+
         out, _, _ = self.ssh.run_sudo_command("ip -6 route show default 2>/dev/null")
+        if not out.strip():
+            out, _, _ = self.ssh.run_sudo_command("ip -6 addr show scope global 2>/dev/null")
+            if not out.strip():
+                return False
+
+        if protocol_type is None:
+            return True
+
+        container_name = self._container_name(protocol_type)
+        out, _, _ = self.ssh.run_sudo_command(
+            f"docker exec {container_name} ip -6 route show default 2>/dev/null"
+        )
         if out.strip():
             return True
-        out, _, _ = self.ssh.run_sudo_command("ip -6 addr show scope global 2>/dev/null")
-        return bool(out.strip())
+
+        logger.info(
+            "Host has IPv6 but container %s has no IPv6 default route "
+            "(Docker IPv6 is disabled), keeping the tunnel IPv4-only",
+            container_name,
+        )
+        return False
 
     # ===================== INSTALLATION =====================
 
@@ -547,11 +592,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
 
         # Step 6: Configure container (generate server keys and config)
         results.append("Configuring AWG...")
-        ipv6_enabled = self._detect_server_ipv6()
+        ipv6_enabled = self._detect_server_ipv6(protocol_type)
         results.append(
-            "IPv6 detected on host, enabling dual-stack tunnel"
+            "IPv6 works end-to-end, enabling dual-stack tunnel"
             if ipv6_enabled else
-            "No IPv6 on host, tunnel will be IPv4-only"
+            "No usable IPv6 (host or Docker), tunnel will be IPv4-only"
         )
         self._configure_container(protocol_type, port, awg_params, ipv6=ipv6_enabled)
         results.append("AWG configured")
@@ -1315,12 +1360,17 @@ AllowedIPs = {allowed_ips}
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
+        # Route ::/0 only when the client actually holds an IPv6 address:
+        # claiming the IPv6 default route on an IPv4-only tunnel blackholes
+        # the client's own native IPv6.
+        peer_allowed_ips = "0.0.0.0/0, ::/0" if client_ipv6 else "0.0.0.0/0"
+
         client_config = "[Interface]\n" + "\n".join(config_lines) + f"""
 
 [Peer]
 PublicKey = {server_pub_key}
 PresharedKey = {psk}
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = {peer_allowed_ips}
 Endpoint = {server_host}:{port}
 PersistentKeepalive = 25
 """
@@ -1407,12 +1457,15 @@ PersistentKeepalive = 25
                     continue
                 config_lines.append(f"{config_key} = {val}")
 
+        # See the client-creation path: ::/0 only on dual-stack tunnels.
+        peer_allowed_ips = "0.0.0.0/0, ::/0" if client_ipv6 else "0.0.0.0/0"
+
         config = "[Interface]\n" + "\n".join(config_lines) + f"""
 
 [Peer]
 PublicKey = {server_pub_key}
 PresharedKey = {psk}
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = {peer_allowed_ips}
 Endpoint = {server_host}:{port}
 PersistentKeepalive = 25
 """

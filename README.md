@@ -60,6 +60,7 @@ Configuration panel for system parameters and preferences:
 
 *   **⚡ VPN Protocols**:
     *   **AmneziaWG (AWG 3.1 / AWG 2.0 / AWG Legacy)**: Advanced WireGuard-based protocol with S3/S4 obfuscation to bypass deep packet inspection (DPI). Three coexisting variants — modern AWG 2.0 with full junk-packet masking, and a legacy variant for older clients.
+    *   **Dual-stack (IPv6)**: enabled automatically only when IPv6 works end-to-end — a global address on the host *and* an IPv6 default route inside the protocol container. Docker networks are IPv4-only unless the daemon is configured for IPv6, so a host-only check would hand clients an IPv6 address with no route out. Override with the `AWG_IPV6` environment variable: `auto` (default), `off` to keep every tunnel IPv4-only, `on` to force dual-stack.
     *   **Classic WireGuard**: Standard, high-performance WireGuard protocol for unmatched speed and broad device compatibility with traffic monitoring support.
     *   **Xray (XTLS-Reality)**: Stealthy protocol that masks VPN traffic as standard HTTPS browsing. Pinned to **Xray-core v26.x**; transparently reads both the **panel layout** (`meta.json` + `clientsTable.json`) and the **native Amnezia client layout** (`xray_*.key` files + `clientsTable`), so a node first installed via the official mobile/desktop app can be attached to the panel without re-installation.
     *   **Telemt (Telegram MTProxy)**: High-performance Telegram MTProxy with TLS emulation and comprehensive management (quotas, IP limits, real-time session tracking). Robust install path that auto-configures Docker's official apt/yum repository when needed.
@@ -266,6 +267,7 @@ web-panel/
 *   **Reverse Proxy**: It is highly recommended to run the panel behind Nginx/Apache with an SSL certificate.
 *   **SSH Keys**: Use SSH keys rather than passwords for connecting to your VPN servers.
 *   **Secret Key**: Set a custom `SECRET_KEY` environment variable for secure session management.
+*   **IPv6**: if your servers have global IPv6 but Docker is IPv4-only, leave `AWG_IPV6` at `auto` — the panel probes the container and keeps tunnels IPv4-only rather than blackholing client IPv6. Set `AWG_IPV6=off` to disable dual-stack everywhere.
 *   **API Tokens**: Treat each token like a password — store it in your integration's secret manager. Revoke it from `/settings` if it leaks or the integration is decommissioned. Rotate periodically; tokens inherit admin rights.
 
 ## 🤝 Contributing
