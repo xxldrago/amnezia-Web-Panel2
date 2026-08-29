@@ -403,5 +403,6 @@
   "reset_traffic": "بازنشانی ترافیک",
   "resetting": "در حال بازنشانی...",
   "reset_traffic_confirm": "ترافیک فعلی این کاربر بازنشانی شود؟ آمار کل حفظ میشود.",
-  "traffic_reset_success": "ترافیک بازنشانی شد"
+  "traffic_reset_success": "ترافیک بازنشانی شد",
+  "port_in_use_by": "پورت {port} قبلاً توسط {owner} استفاده شده است. پورت دیگری انتخاب کنید."
 }
