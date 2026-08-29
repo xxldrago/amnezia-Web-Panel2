@@ -436,5 +436,7 @@
   "reset_traffic": "Reset traffic",
   "resetting": "Resetting...",
   "reset_traffic_confirm": "Reset this user's current traffic? Total statistics will be kept.",
-  "traffic_reset_success": "Traffic reset"
+  "traffic_reset_success": "Traffic reset",
+  "max_speed": "Max speed (Mbps)",
+  "speed_limit_unlim": "Speed limit (0 = unlim.)"
 }

@@ -403,5 +403,7 @@
   "reset_traffic": "بازنشانی ترافیک",
   "resetting": "در حال بازنشانی...",
   "reset_traffic_confirm": "ترافیک فعلی این کاربر بازنشانی شود؟ آمار کل حفظ میشود.",
-  "traffic_reset_success": "ترافیک بازنشانی شد"
+  "traffic_reset_success": "ترافیک بازنشانی شد",
+  "max_speed": "حداکثر سرعت (Mbps)",
+  "speed_limit_unlim": "محدودیت سرعت (0 = نامحدود)"
 }

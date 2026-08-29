@@ -2070,6 +2070,10 @@
                 if (assignedUser) metaHtml += `<span class="badge badge-info" style="font-size:0.65rem;">👤 ${escapeHtml(assignedUser)}</span>`;
                 if (created) metaHtml += `<span>📅 ${formatDate(created)}</span>`;
 
+                // Per-peer bandwidth limit badge (AWG): ∞ by default, ⚡X Mbps when set
+                const maxSpeed = parseFloat(userData.maxSpeed || 0) || 0;
+                if (proto.startsWith('awg')) metaHtml += `<span class="traffic-badge" title="${_('max_speed')}">⚡${maxSpeed > 0 ? maxSpeed + ' Mbps' : '<span style="font-size:1.25em; line-height:0;">∞</span>'}</span>`;
+
                 if (proto === 'telemt') {
                     if (userData.total_octets) metaHtml += `<span class="traffic-badge">📊 ${formatBytes(userData.total_octets)}</span>`;
                     if (userData.current_connections !== undefined) metaHtml += `<span>🔌 ${userData.current_connections} conns</span>`;
@@ -2094,7 +2098,7 @@
                 const canShowConfig = proto === 'xray' || true; // always show 📄 button
 
                 listEl.innerHTML += `
-                    <div class="client-item" style="${disabledStyle}">
+                    <div class="client-item" style="${disabledStyle}" data-maxspeed="${maxSpeed}">
                         <div class="client-info">
                             <div class="client-avatar${client._online ? ' avatar-online' : ''}">${initial}</div>
                             <div>
@@ -2243,27 +2247,43 @@
         const item = btn.closest('.client-item');
         const nameEl = item.querySelector('.client-name');
         const oldName = nameEl.textContent;
+        const proto = document.getElementById('connProtoSelect').value;
+        const isAwg = proto.startsWith('awg');
+        const curSpeed = item.dataset.maxspeed || '0';
         nameEl.innerHTML = `
-            <span class="rename-editor" style="display:inline-flex;gap:4px;align-items:center;">
-                <input type="text" class="form-input" style="padding:2px 8px;font-size:0.85rem;width:160px;height:auto;" value="${escapeHtml(oldName)}">
+            <span class="rename-editor" style="display:inline-flex;gap:12px;align-items:flex-end;flex-wrap:wrap;">
+                <label style="display:flex;flex-direction:column;gap:2px;font-size:0.7rem;opacity:.7;">
+                    ${_('name')}
+                    <input type="text" class="form-input" style="padding:2px 8px;font-size:0.85rem;width:160px;height:auto;" value="${escapeHtml(oldName)}">
+                </label>
+                ${isAwg ? `<label style="display:flex;flex-direction:column;gap:2px;font-size:0.7rem;opacity:.7;">
+                    ${_('speed_limit_unlim')}
+                    <input type="number" class="form-input rename-speed" min="0" step="0.1" style="padding:2px 8px;font-size:0.85rem;width:110px;height:auto;" value="${curSpeed}" placeholder="∞">
+                </label>` : ''}
                 <button class="btn btn-secondary btn-sm btn-icon" title="${_('save')}">✔</button>
                 <button class="btn btn-secondary btn-sm btn-icon rename-cancel" title="${_('cancel')}">✖</button>
             </span>
         `;
         const input = nameEl.querySelector('input');
+        const speedInput = nameEl.querySelector('.rename-speed');
         const saveBtn = nameEl.querySelector('button:not(.rename-cancel)');
         const cancelBtn = nameEl.querySelector('.rename-cancel');
-        saveBtn.addEventListener('click', () => saveRenameConnection(clientId, input.value));
+        const doSave = () => saveRenameConnection(clientId, input.value, speedInput ? (parseFloat(speedInput.value) || 0) : -1);
+        saveBtn.addEventListener('click', doSave);
         cancelBtn.addEventListener('click', () => loadConnections());
         input.addEventListener('keydown', (e) => {
-            if (e.key === 'Enter') saveRenameConnection(clientId, input.value);
+            if (e.key === 'Enter') doSave();
+            if (e.key === 'Escape') loadConnections();
+        });
+        if (speedInput) speedInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') doSave();
             if (e.key === 'Escape') loadConnections();
         });
         input.focus();
         input.select();
     }
 
-    async function saveRenameConnection(clientId, rawName) {
+    async function saveRenameConnection(clientId, rawName, maxSpeed = -1) {
         const proto = document.getElementById('connProtoSelect').value;
         const newName = (rawName || '').trim();
         if (!newName) {
@@ -2272,9 +2292,13 @@
         }
         try {
             const result = await apiCall(`/api/servers/${SERVER_ID}/connections/rename`, 'POST', {
-                protocol: proto, client_id: clientId, new_name: newName,
+                protocol: proto, client_id: clientId, new_name: newName, max_speed: maxSpeed,
             });
-            showToast(_('connection_renamed'), 'success');
+            if (result.speed_warning) {
+                showToast(_('error') + ': ' + result.speed_warning, 'error');
+            } else {
+                showToast(_('connection_renamed'), 'success');
+            }
             // If the config modal is open for this connection, retitle it too.
             if (currentConfigClientId === clientId &&
                 document.getElementById('configModal').classList.contains('active')) {
