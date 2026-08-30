@@ -1676,8 +1676,49 @@ class TunnelStartRequest(BaseModel):
 
 # ======================== Startup ========================
 
+# Interval (seconds) between background connection-flood collection rounds.
+# Each round is one cheap SSH roundtrip per AWG instance (a compact per-IP
+# conntrack summary), so detection works 24/7 without anyone watching the UI
+# and the 6s UI refresh only reads the small snapshot files.
+CONN_MONITOR_INTERVAL = 600
+
+
+def _conn_monitor_loop():
+    from managers.awg_manager import AWGManager
+    while True:
+        try:
+            data = load_data()
+            for server in data.get('servers', []):
+                protocols = server.get('protocols', {}) or {}
+                for proto in list(protocols):
+                    if protocol_base(proto) not in ('awg', 'awg2', 'awg3'):
+                        continue
+                    try:
+                        AWGManager(get_ssh(server)).collect_conn_stats(proto)
+                    except Exception as e:
+                        logger.warning(
+                            f"conn monitor: {server.get('host')} {proto}: {e}")
+        except Exception as e:
+            logger.warning(f"conn monitor loop: {e}")
+        time.sleep(CONN_MONITOR_INTERVAL)
+
+
+_conn_monitor_started = False
+
+
+def _start_conn_monitor():
+    global _conn_monitor_started
+    if _conn_monitor_started:
+        return
+    _conn_monitor_started = True
+    threading.Thread(target=_conn_monitor_loop, daemon=True,
+                     name='conn-monitor').start()
+    logger.info(f"Connection-flood monitor started (every {CONN_MONITOR_INTERVAL}s)")
+
+
 @app.on_event("startup")
 async def startup():
+    _start_conn_monitor()
     data = load_data()
     changed = False
     if not data.get('users'):
@@ -3232,6 +3273,27 @@ async def api_edit_connection(request: Request, server_id: int, req: EditConnect
         return result
     except Exception as e:
         logger.exception("Error editing connection")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
+@app.post('/api/servers/{server_id}/connections/clear_warnings', tags=["Connections"])
+async def api_clear_conn_warnings(request: Request, server_id: int, req: ConnectionActionRequest):
+    """Clear recorded connection-flood (torrent) warnings for one peer."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        manager = get_protocol_manager(ssh, req.protocol)
+        result = _manager_call(manager, 'clear_conn_warnings', req.protocol, req.client_id) or {}
+        ssh.disconnect()
+        return result
+    except Exception as e:
+        logger.exception("Error clearing connection warnings")
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
