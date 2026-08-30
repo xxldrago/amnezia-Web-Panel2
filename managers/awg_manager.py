@@ -132,6 +132,16 @@ def generate_awg_params(use_ranges=False, awg3=False):
             return result
         
         h1, h2, h3, h4 = make_ranges()
+    elif awg3:
+        # AWG 3.1: the official docs prescribe the compatibility values
+        # 1,2,3,4 when HeaderProtection is enabled - the custom-header
+        # mechanism is OFF then and Header Protection (ChaCha20 with the
+        # random per-server HeaderProtectionKey) hides the message type.
+        # This is exactly what the native AmneziaVPN client generates.
+        # Ranged H1-H4 with RandomTrailers=on are actively harmful:
+        # transport packets get misclassified as handshakes and die at
+        # CheckMAC1 (amneziawg-go#186, kernel-module#226).
+        h1, h2, h3, h4 = '1', '2', '3', '4'
     else:
         h1 = str(random.randint(100000000, 4294967295))
         h2 = str(random.randint(100000000, 4294967295))
@@ -457,7 +467,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         if awg_params is None:
             base_proto = self._base_protocol(protocol_type)
             awg_params = generate_awg_params(
-                use_ranges=(base_proto in (self.AWG, self.AWG2, self.AWG3)),
+                # AWG 2.0: ranged H1-H4 ("min-max"). AWG 3.1: fixed 1,2,3,4
+                # per the official docs (custom headers off, Header
+                # Protection hides the message type) - same as the native
+                # AmneziaVPN client generates.
+                use_ranges=(base_proto in (self.AWG, self.AWG2)),
                 awg3=(base_proto == self.AWG3),
             )
 
