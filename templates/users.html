@@ -383,7 +383,14 @@
         </div>
         <div class="config-panel" id="panel-qr">
             <div class="qr-container">
+                <div class="qr-format hidden" id="qrFormat">
+                    <button type="button" class="qr-format-btn active" data-fmt="amnezia"
+                        onclick="setQrFormat('amnezia')">{{ _('qr_format_amnezia') }}</button>
+                    <button type="button" class="qr-format-btn" data-fmt="wireguard"
+                        onclick="setQrFormat('wireguard')">{{ _('qr_format_wireguard') }}</button>
+                </div>
                 <div id="qrCode"></div>
+                <div class="qr-hint" id="qrFormatHint"></div>
             </div>
         </div>
     </div>
@@ -702,7 +709,7 @@
                 switchConfigTab('conf');
                 closeModal('addUserModal');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.config, result.vpn_qr_chunks);
             } else {
                 setTimeout(() => window.location.reload(), 500);
             }
@@ -830,7 +837,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.config, result.vpn_qr_chunks);
             }
             setTimeout(() => window.location.reload(), 1000);
         } catch (err) {
@@ -887,15 +894,89 @@
         const tabIdx = { conf: 0, vpn: 1, qr: 2 };
         tabs[tabIdx[tab]].classList.add('active');
         document.getElementById(panels[tab]).classList.add('active');
+        // the frame series only animates while its panel is on screen
+        if (tab === 'qr') { renderQR(); } else { stopQrAnimation(); }
     }
 
-    function generateQR(text) {
+    // The QR shows one of two payloads: Amnezia's own config format, split into
+    // the frame series ImportController::parseQrCodeChunk reassembles, or the
+    // raw config, which is all AmneziaWG and wg-quick understand. The series
+    // exists because a whole config in one code lands at QR version 21-26,
+    // while the Android scanner reads 640x480 camera frames and cannot decode
+    // anything that dense. Every frame below stays under 55x55 modules.
+    const QR_FRAME_MS = 800;
+
+    let currentQrConfig = '';
+    let currentQrChunks = [];
+    let currentQrFormat = 'amnezia';
+    let qrFrame = 0;
+    let qrTimer = null;
+
+    function setQrFormat(format) {
+        currentQrFormat = format;
+        qrFrame = 0;
+        renderQR();
+    }
+
+    function generateQR(text, chunks) {
+        currentQrConfig = text || '';
+        currentQrChunks = chunks || [];
+        qrFrame = 0;
+        renderQR();
+    }
+
+    function stopQrAnimation() {
+        if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
+    }
+
+    function drawQr(text, size) {
         const container = document.getElementById('qrCode');
+        if (!container) return;
         container.innerHTML = '';
         try {
-            new QRCode(container, { text, width: 280, height: 280, colorDark: '#000000', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.L });
+            new QRCode(container, {
+                text: text, width: size, height: size,
+                colorDark: '#000000', colorLight: '#ffffff',
+                correctLevel: QRCode.CorrectLevel.L
+            });
         } catch (e) {
-            container.innerHTML = `<div style="color:var(--text-muted);">${_('qr_error')}</div>`;
+            container.innerHTML = `<div style="color:var(--text-muted);font-size:0.85rem;">${_('qr_error')}</div>`;
+        }
+    }
+
+    function renderQR() {
+        stopQrAnimation();
+        const named = currentQrFormat === 'amnezia' && currentQrChunks.length > 0;
+        const switcher = document.getElementById('qrFormat');
+        if (switcher) {
+            switcher.classList.toggle('hidden', currentQrChunks.length === 0);
+            switcher.querySelectorAll('.qr-format-btn').forEach(b =>
+                b.classList.toggle('active', b.dataset.fmt === (named ? 'amnezia' : 'wireguard')));
+        }
+        const hint = document.getElementById('qrFormatHint');
+        if (!named) {
+            if (hint) hint.textContent = _('qr_format_wireguard_hint');
+            drawQr(currentQrConfig, 280);
+            return;
+        }
+        const paint = () => {
+            drawQr(currentQrChunks[qrFrame], 300);
+            if (hint) {
+                hint.textContent = currentQrChunks.length > 1
+                    ? `${_('qr_format_amnezia_hint')} ${qrFrame + 1}/${currentQrChunks.length}`
+                    : _('qr_format_amnezia_hint');
+            }
+        };
+        paint();
+        if (currentQrChunks.length > 1) {
+            qrTimer = setInterval(() => {
+                // the modal was closed or another tab opened -- offsetParent is
+                // null once the panel is off screen, so stop burning a timer
+                const container = document.getElementById('qrCode');
+                if (!container || !container.offsetParent) { stopQrAnimation(); return; }
+                qrFrame = (qrFrame + 1) % currentQrChunks.length;
+                paint();
+            }, QR_FRAME_MS);
         }
     }
     async function showUserConnectionConfig(serverId, clientId, protocol, connName) {
@@ -913,7 +994,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.config, result.vpn_qr_chunks);
             }
         } catch (err) {
             showToast(`${_('error')}: ` + err.message, 'error');

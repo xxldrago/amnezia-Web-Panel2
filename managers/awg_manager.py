@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Default AWG parameters (from protocols_defs.h)
 AWG_DEFAULTS = {
     'port': '55424',
-    'mtu': '1280',
+    'mtu': '1376',
     'subnet_address': '10.8.1.0',
     'subnet_cidr': '24',
     'subnet_ip': '10.8.1.1',
@@ -72,6 +72,91 @@ AWG3_CONFIG_KEYS = tuple(config_key for _, config_key in AWG3_PARAM_MAP)
 # "Invalid argument": the explanation only goes to net_dbg_ratelimited.
 AWG3_MIN_JUNK_SIZE = 12
 
+# Special junk packets I1-I5: free-form packets the peer sends right before
+# the handshake initiation, so a session opens with bytes that belong to some
+# other protocol. The kernel module parses each value as a list of tags
+# (jp_parse_tags in junk.c):
+#   <b 0xHEX>  fixed bytes          <r N>   N random bytes
+#   <c>        packet counter, 4B   <rc N>  N random latin letters
+#   <t>        unix time, 4B        <rd N>  N random digits
+SPECIAL_JUNK_KEYS = ('i1', 'i2', 'i3', 'i4', 'i5')
+
+# Byte-identical to protocols::awg::defaultSpecialJunk1 in the desktop client:
+# a DNS response for icloud.com preceded by a random 2-byte transaction id.
+AWG_DEFAULT_I1 = (
+    '<r 2><b 0x858000010001000000000669636c6f756403636f6d'
+    '0000010001c00c000100010000105a00044d583737>'
+)
+
+_SPECIAL_JUNK_TAG_RE = re.compile(r'<\s*(b|c|t|r|rc|rd)(?:\s+([^>]*?))?\s*>')
+
+# A junk packet still has to fit into one datagram.
+SPECIAL_JUNK_MAX_SIZE = 1280
+
+
+def validate_special_junk(value):
+    """Validate an I1-I5 value and return the packet size it produces.
+
+    Two failure modes make this worth checking before the value reaches a
+    server config. A tag the module cannot parse takes the whole interface
+    down with a bare EINVAL, and a value with no tags at all -- the literal
+    `I1 = 0` this panel used to write -- parses cleanly but builds a
+    zero-length packet, so nothing is ever sent and the config only looks
+    like obfuscation is on.
+    """
+    text = (value or '').strip()
+    if not text:
+        return 0
+
+    size = 0
+    pos = 0
+    for match in _SPECIAL_JUNK_TAG_RE.finditer(text):
+        between = text[pos:match.start()].strip()
+        if between:
+            raise ValueError(f"unexpected text outside a tag: {between!r}")
+        pos = match.end()
+
+        tag = match.group(1)
+        arg = (match.group(2) or '').strip()
+        if tag in ('c', 't'):
+            if arg:
+                raise ValueError(f"<{tag}> takes no argument")
+            size += 4
+        elif tag == 'b':
+            digits = arg[2:] if arg[:2].lower() == '0x' else ''
+            if not digits or len(digits) % 2 or not all(c in '0123456789abcdefABCDEF' for c in digits):
+                raise ValueError("<b> expects an even number of hex digits, e.g. <b 0xdeadbeef>")
+            size += len(digits) // 2
+        else:
+            if not arg.isdigit() or int(arg) <= 0:
+                raise ValueError(f"<{tag}> expects a positive byte count, e.g. <{tag} 16>")
+            size += int(arg)
+
+    trailing = text[pos:].strip()
+    if trailing:
+        raise ValueError(f"unexpected text outside a tag: {trailing!r}")
+    if size == 0:
+        raise ValueError("no packet tags found, nothing would be sent")
+    if size > SPECIAL_JUNK_MAX_SIZE:
+        raise ValueError(f"packet is {size} bytes, maximum is {SPECIAL_JUNK_MAX_SIZE}")
+    return size
+
+
+def normalize_special_junk(values):
+    """Validate a {'i1': ..., 'i5': ...} mapping and drop the empty entries."""
+    result = {}
+    for key in SPECIAL_JUNK_KEYS:
+        value = (values or {}).get(key)
+        value = (value or '').strip()
+        if not value:
+            continue
+        try:
+            validate_special_junk(value)
+        except ValueError as exc:
+            raise ValueError(f"{key.upper()}: {exc}") from exc
+        result[key] = value
+    return result
+
 
 def generate_wg_keypair():
     """Generate a WireGuard X25519 keypair (private, public) as base64 strings."""
@@ -102,6 +187,7 @@ def generate_awg_params(use_ranges=False, awg3=False):
     For legacy AWG (use_ranges=False): generates fixed single H values.
     For AWG 3.1 (awg3=True): additionally generates header protection key,
     content padding and randomized protocol timings.
+    Non-legacy protocols also get the default special junk packet (I1).
     """
     import random
 
@@ -151,6 +237,11 @@ def generate_awg_params(use_ranges=False, awg3=False):
         'underload_packet_magic_header': h3,
         'transport_packet_magic_header': h4,
     }
+
+    if use_ranges:
+        # The desktop client ships a special junk packet out of the box; not
+        # setting one leaves the first packet of every session recognisable.
+        params['i1'] = AWG_DEFAULT_I1
 
     if awg3:
         # Ranges are "min-max" (u16_range_from_string in amneziawg-tools).
@@ -445,21 +536,35 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         self.ssh.run_sudo_script(script)
         return True
 
-    def install_protocol(self, protocol_type, port=None, awg_params=None):
+    def install_protocol(self, protocol_type, port=None, awg_params=None,
+                         mtu=None, dns=None, special_junk=None):
         """
         Full installation of AWG or AWG-Legacy protocol.
         Steps: install docker -> prepare host -> build container ->
                configure container -> run container -> setup firewall
+
+        mtu/dns end up in the generated client configs; special_junk is an
+        {'i1': ..., 'i5': ...} mapping overriding the generated I1-I5.
         """
         if port is None:
             port = AWG_DEFAULTS['port']
 
+        base_proto = self._base_protocol(protocol_type)
         if awg_params is None:
-            base_proto = self._base_protocol(protocol_type)
             awg_params = generate_awg_params(
                 use_ranges=(base_proto in (self.AWG, self.AWG2, self.AWG3)),
                 awg3=(base_proto == self.AWG3),
             )
+
+        if special_junk is not None:
+            # An explicit mapping replaces the generated set outright, so
+            # clearing I1 in the UI actually clears it.
+            for key in SPECIAL_JUNK_KEYS:
+                awg_params.pop(key, None)
+            awg_params.update(normalize_special_junk(special_junk))
+
+        mtu = str(mtu or AWG_DEFAULTS['mtu']).strip()
+        dns = (dns or '').strip() or self._default_dns()
 
         container_name = self._container_name(protocol_type)
         docker_image = self._docker_image(protocol_type)
@@ -553,7 +658,8 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             if ipv6_enabled else
             "No IPv6 on host, tunnel will be IPv4-only"
         )
-        self._configure_container(protocol_type, port, awg_params, ipv6=ipv6_enabled)
+        self._configure_container(protocol_type, port, awg_params, ipv6=ipv6_enabled,
+                                  mtu=mtu, dns=dns)
         results.append("AWG configured")
 
         # Step 7: Upload and run start script
@@ -571,6 +677,8 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             'protocol': protocol_type,
             'port': port,
             'awg_params': awg_params,
+            'mtu': mtu,
+            'dns': dns,
             'log': results,
         }
 
@@ -599,7 +707,8 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             f"(status: {last_status}). Logs:\n{logs_out}"
         )
 
-    def _configure_container(self, protocol_type, port, awg_params, ipv6=False):
+    def _configure_container(self, protocol_type, port, awg_params, ipv6=False,
+                             mtu=None, dns=None):
         """Configure the AWG container (generate keys and server config)."""
         container_name = self._container_name(protocol_type)
         wg_bin = self._wg_binary(protocol_type)
@@ -614,6 +723,21 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             f"{config_key} = {awg_params[param_key]}\n"
             for param_key, config_key in AWG3_PARAM_MAP
             if awg_params.get(param_key)
+        )
+
+        special_junk_lines = ''.join(
+            f"{param_key.upper()} = {awg_params[param_key]}\n"
+            for param_key in SPECIAL_JUNK_KEYS
+            if awg_params.get(param_key)
+        )
+
+        # MTU and DNS belong to the generated client configs, not to the
+        # server interface, so they are stored as comments: awg-quick would
+        # otherwise resize the server tunnel and call resolvconf, which the
+        # container does not have. _get_mtu/_get_dns read them back.
+        client_defaults_lines = (
+            f"# MTU = {mtu or AWG_DEFAULTS['mtu']}\n"
+            f"# DNS = {dns or self._default_dns()}\n"
         )
 
         address_line = f"{subnet_ip}/{subnet_cidr}"
@@ -650,14 +774,7 @@ H1 = {awg_params['init_packet_magic_header']}
 H2 = {awg_params['response_packet_magic_header']}
 H3 = {awg_params['underload_packet_magic_header']}
 H4 = {awg_params['transport_packet_magic_header']}
-{awg3_config_lines}# Signature Chain parameters (AWG 2.0+)
-# I1 = 0
-# I2 = 0
-# I3 = 0
-# I4 = 0
-# I5 = 0
-# CPS = signature
-EOF
+{special_junk_lines}{awg3_config_lines}{client_defaults_lines}EOF
 """
         else:
             # AWG Legacy uses wg commands
@@ -687,7 +804,7 @@ H1 = {awg_params['init_packet_magic_header']}
 H2 = {awg_params['response_packet_magic_header']}
 H3 = {awg_params['underload_packet_magic_header']}
 H4 = {awg_params['transport_packet_magic_header']}
-EOF
+{client_defaults_lines}EOF
 """
 
         out, err, code = self.ssh.run_sudo_command(
@@ -1273,8 +1390,7 @@ AllowedIPs = {allowed_ips}
             port = awg_params['port']
 
         dns = self._get_dns(protocol_type)
-
-        mtu = AWG_DEFAULTS['mtu']
+        mtu = self._get_mtu(protocol_type)
 
         # Standard fields (dual-stack when the client has an IPv6 address)
         address_line = f"{client_ip}/32" + (f", {client_ipv6}/128" if client_ipv6 else "")
@@ -1365,8 +1481,7 @@ PersistentKeepalive = 25
             port = awg_params['port']
 
         dns = self._get_dns(protocol_type, ud)
-
-        mtu = AWG_DEFAULTS['mtu']
+        mtu = self._get_mtu(protocol_type, ud)
 
         # Standard fields (dual-stack when the client has an IPv6 address)
         address_line = f"{client_ip}/32" + (f", {client_ipv6}/128" if client_ipv6 else "")
@@ -1577,6 +1692,44 @@ AllowedIPs = {allowed_ips}
 
         return True
 
+    def _default_dns(self):
+        """Fallback DNS pair: the AmneziaDNS container when it is installed,
+        otherwise the built-in resolvers."""
+        dns1 = AWG_DEFAULTS['dns1']
+        dns2 = AWG_DEFAULTS['dns2']
+        try:
+            out, _, _ = self.ssh.run_sudo_command(
+                "docker ps -a --filter name=^amnezia-dns$ --format '{{.Names}}'"
+            )
+            if 'amnezia-dns' in out:
+                dns1 = '172.29.172.254'
+        except Exception:
+            pass
+        return f"{dns1}, {dns2}"
+
+    def _read_config_key(self, protocol_type, key):
+        """Read a key from the server config, comment or not.
+
+        MTU and DNS are stored commented out on purpose (see
+        _configure_container), so both forms have to be accepted.
+        """
+        try:
+            server_config = self._get_server_config(protocol_type)
+        except Exception:
+            return None
+        for line in server_config.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('#'):
+                stripped = stripped.lstrip('#').strip()
+            if '=' not in stripped:
+                continue
+            name, _, value = stripped.partition('=')
+            if name.strip() == key:
+                value = value.strip()
+                if value:
+                    return value
+        return None
+
     def _get_dns(self, protocol_type, user_data=None):
         """DNS servers for generated client configs.
 
@@ -1587,28 +1740,140 @@ AllowedIPs = {allowed_ips}
         """
         if user_data and user_data.get('dns'):
             return user_data['dns']
-        try:
-            server_config = self._get_server_config(protocol_type)
-            for line in server_config.split('\n'):
-                stripped = line.strip()
-                if stripped.startswith('#'):
-                    stripped = stripped.lstrip('#').strip()
-                if stripped.startswith('DNS') and '=' in stripped:
-                    return stripped.split('=', 1)[1].strip()
-        except Exception:
-            pass
-        dns1 = AWG_DEFAULTS['dns1']
-        dns2 = AWG_DEFAULTS['dns2']
-        out, _, _ = self.ssh.run_sudo_command("docker ps -a --filter name=^amnezia-dns$ --format '{{.Names}}'")
-        if 'amnezia-dns' in out:
-            dns1 = '172.29.172.254'
-        return f"{dns1}, {dns2}"
+        return self._read_config_key(protocol_type, 'DNS') or self._default_dns()
+
+    def get_awg_settings(self, protocol_type):
+        """Client-facing AWG settings currently stored in the server config."""
+        params = self._get_awg_params_from_config(protocol_type)
+        settings = {
+            'mtu': self._get_mtu(protocol_type),
+            'dns': self._get_dns(protocol_type),
+            'default_i1': AWG_DEFAULT_I1,
+            'supports_special_junk': self._base_protocol(protocol_type) != self.AWG_LEGACY,
+        }
+        for key in SPECIAL_JUNK_KEYS:
+            settings[key] = params.get(key, '')
+        return settings
+
+    def update_awg_settings(self, protocol_type, mtu=None, dns=None, special_junk=None):
+        """Rewrite MTU/DNS/I1-I5 in the server config and apply them live.
+
+        I1-I5 go to the kernel through `awg syncconf`, so peers stay up; MTU
+        and DNS only matter when a client config is generated. Existing
+        clients pick the new values up on their next config export -- the
+        config they already imported keeps the old ones.
+        """
+        if self._base_protocol(protocol_type) == self.AWG_LEGACY:
+            special_junk = None
+        junk = normalize_special_junk(special_junk) if special_junk is not None else None
+
+        current_junk = self._get_awg_params_from_config(protocol_type)
+        config = self._get_server_config(protocol_type)
+        lines = config.split('\n')
+
+        def key_of(line):
+            stripped = line.strip()
+            if stripped.startswith('#'):
+                stripped = stripped.lstrip('#').strip()
+            if '=' not in stripped:
+                return None
+            return stripped.partition('=')[0].strip()
+
+        # A None means "leave this alone"; an empty string means "clear it",
+        # which drops the line so the built-in default applies again.
+        replaced = {}
+        if mtu is not None:
+            value = str(mtu).strip()
+            replaced['MTU'] = f"# MTU = {value}" if value else None
+        if dns is not None:
+            value = str(dns).strip()
+            replaced['DNS'] = f"# DNS = {value}" if value else None
+        if junk is not None:
+            for key in SPECIAL_JUNK_KEYS:
+                value = junk.get(key)
+                replaced[key.upper()] = f"{key.upper()} = {value}" if value else None
+
+        # Everything lives in [Interface]; drop the old occurrences first so a
+        # cleared field really disappears instead of being shadowed.
+        interface_end = len(lines)
+        for idx, line in enumerate(lines):
+            if idx and line.strip().startswith('['):
+                interface_end = idx
+                break
+
+        head = [line for line in lines[:interface_end] if key_of(line) not in replaced]
+        while head and not head[-1].strip():
+            head.pop()
+        head.extend(value for value in replaced.values() if value)
+
+        tail = lines[interface_end:]
+        if tail:
+            head.append('')  # keep [Interface] and [Peer] visually apart
+        self._write_server_config(protocol_type, '\n'.join(head + tail))
+
+        if junk is not None:
+            # There is no way to spell an empty I1-I5 in a config file
+            # (get_value in amneziawg-tools rejects `I1 =`), so a dropped
+            # packet cannot be pushed through syncconf -- the kernel would
+            # keep sending the old one. Recreating the interface is the only
+            # way to make a removal take effect.
+            dropped = any(current_junk.get(key) and not junk.get(key)
+                          for key in SPECIAL_JUNK_KEYS)
+            if dropped:
+                self._restart_container(protocol_type)
+            else:
+                self._sync_server_config(protocol_type)
+        return self.get_awg_settings(protocol_type)
+
+    def _write_server_config(self, protocol_type, config_content):
+        """Upload the server config into the container without restarting it."""
+        container_name = self._container_name(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+        self.ssh.upload_file(config_content.replace('\r\n', '\n'), "/tmp/_amnz_settings.conf")
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_settings.conf {container_name}:{config_path}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_settings.conf")
+        if code != 0:
+            raise RuntimeError(f"Failed to write server config: {err or out}")
+
+    def _restart_container(self, protocol_type):
+        """Restart the container so its start script recreates the interface."""
+        container_name = self._container_name(protocol_type)
+        out, err, code = self.ssh.run_sudo_command(f"docker restart {container_name}")
+        if code != 0:
+            raise RuntimeError(f"Failed to restart {container_name}: {err or out}")
+
+    def _sync_server_config(self, protocol_type):
+        """Apply the on-disk server config to the running interface."""
+        container_name = self._container_name(protocol_type)
+        wg_bin = self._wg_binary(protocol_type)
+        quick_bin = self._quick_binary(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+        iface = self._interface_name(protocol_type, config_path)
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} bash -c "
+            f"'{wg_bin} syncconf {iface} <({quick_bin} strip {config_path})'"
+        )
+        if code != 0:
+            raise RuntimeError(f"Failed to apply config: {err or out}")
+
+    def _get_mtu(self, protocol_type, user_data=None):
+        """MTU for generated client configs.
+
+        Priority: per-client override > `MTU = ...` line in the server config
+        > built-in default. Amnezia's own clients use 1376; the 1280 this
+        panel used to hardcode is itself a usable fingerprint.
+        """
+        if user_data and user_data.get('mtu'):
+            return str(user_data['mtu'])
+        return self._read_config_key(protocol_type, 'MTU') or AWG_DEFAULTS['mtu']
 
     def save_client_config(self, protocol_type, client_id, config_text):
         """Persist a manually edited client config. Stored verbatim in
         clientsTable (userData.customConfig) and returned by get_client_config
-        from now on; the DNS line is indexed into userData.dns as the
-        per-client override for future regenerations."""
+        from now on; the DNS and MTU lines are indexed into userData as the
+        per-client overrides _get_dns/_get_mtu read on future regenerations."""
         config_text = (config_text or '').strip()
         if not config_text:
             raise RuntimeError('Config is empty')
@@ -1619,11 +1884,16 @@ AllowedIPs = {allowed_ips}
         ud = client.setdefault('userData', {})
         ud['customConfig'] = config_text
         ud.pop('dns', None)
+        ud.pop('mtu', None)
+        indexed = {'DNS': 'dns', 'MTU': 'mtu'}
         for line in config_text.split('\n'):
             stripped = line.strip()
-            if stripped.startswith('DNS') and '=' in stripped:
-                ud['dns'] = stripped.split('=', 1)[1].strip()
-                break
+            if stripped.startswith('#') or '=' not in stripped:
+                continue
+            name, _, value = stripped.partition('=')
+            field = indexed.get(name.strip())
+            if field and value.strip():
+                ud[field] = value.strip()
         self._save_clients_table(protocol_type, clients_table)
         return {'status': 'success'}
 

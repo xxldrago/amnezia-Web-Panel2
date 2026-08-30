@@ -561,7 +561,7 @@ async def _send_config_by_client(api: TelegramAPI, chat_id: int, server: dict, p
                 for i, chunk in enumerate(chunks, 1):
                     await api.send_message(chat_id, f"<b>📄 Configuration (part {i}/{len(chunks)}):</b>\n<pre>{_e(chunk)}</pre>")
 
-            vpn_link = generate_vpn_link_fn(config) if config else ""
+            vpn_link = generate_vpn_link_fn(config, server, proto) if config else ""
             if vpn_link:
                 await api.send_message(chat_id, f"🔗 <b>VPN Link</b> (tap to copy):\n<code>{_e(vpn_link)}</code>")
             filename = f"{str(conn_name).replace(' ', '_')}.conf"
@@ -910,7 +910,7 @@ async def _send_config_text(api: TelegramAPI, chat_id: int, server: dict, proto:
         await api.send_message(chat_id, f"🔗 <b>Connection link</b>:\n<code>{_e(config)}</code>")
     else:
         await api.send_message(chat_id, f"<b>📄 Configuration:</b>\n<pre>{_e(config)}</pre>")
-        vpn_link = generate_vpn_link_fn(config) if config else ""
+        vpn_link = generate_vpn_link_fn(config, server, proto) if config else ""
         if vpn_link:
             await api.send_message(chat_id, f"🔗 <b>VPN Link</b>:\n<code>{_e(vpn_link)}</code>")
         await api.send_document(chat_id, filename=f"{conn_name}.conf", content=config.encode("utf-8"), caption=f"📁 Config file: {conn_name}")
