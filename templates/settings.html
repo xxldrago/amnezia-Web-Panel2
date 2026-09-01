@@ -160,6 +160,26 @@
                         </button>
                     </div>
                 </div>
+
+
+                <div class="tunnel-row" data-provider="warp" style="padding: var(--space-md); border: 1px solid var(--border-color); border-radius: var(--radius-md); background: var(--bg-primary);">
+                    <div style="display:flex; align-items:center; justify-content:space-between; gap:var(--space-md); margin-bottom: var(--space-sm);">
+                        <strong>Cloudflare WARP</strong>
+                        <span class="badge badge-secondary" id="warpInstallBadge">{{ _('not_installed') }}</span>
+                    </div>
+                    <div id="warpStatusText" class="form-hint" style="margin-bottom: var(--space-sm);">{{ _('warp_status_unknown') }}</div>
+                    <div id="warpHintText" class="form-hint" style="margin-bottom: var(--space-sm);">{{ _('warp_hint') }}</div>
+                    <div style="display:grid; grid-template-columns: 1fr 1fr; gap: var(--space-sm);">
+                        <button type="button" class="btn btn-primary" id="warpConnectBtn" onclick="connectWarp()">
+                            <span id="warpConnectBtnText">{{ _('warp_connect') }}</span>
+                            <div class="spinner hidden" id="warpConnectSpinner" style="width:14px; height:14px;"></div>
+                        </button>
+                        <button type="button" class="btn btn-secondary hidden" id="warpDisconnectBtn" onclick="disconnectWarp()">
+                            <span id="warpDisconnectBtnText">{{ _('warp_disconnect') }}</span>
+                            <div class="spinner hidden" id="warpDisconnectSpinner" style="width:14px; height:14px;"></div>
+                        </button>
+                    </div>
+                </div>
             </div>
             <p class="form-hint" style="margin-top: var(--space-md);">{{ _('tunnels_hint') }}</p>
         </div>
@@ -339,6 +359,40 @@
                             <span>⬆️</span> {{ _('restore_backup') }}
                         </button>
                     </div>
+                </div>
+
+                <div style="border-top: 1px solid var(--border-color); padding-top: var(--space-md);">
+                    <h4 style="margin: 0 0 var(--space-sm) 0; font-size: 0.95rem;">{{ _('auto_backup_title') }}</h4>
+                    <form id="autoBackupForm">
+                        <div class="form-group">
+                            <label style="display: flex; align-items: center; gap: var(--space-sm); cursor: pointer;">
+                                <input type="checkbox" name="enabled" id="autoBackupEnabled" {% if settings.auto_backup.enabled %}checked{% endif %}>
+                                {{ _('enable_auto_backup') }}
+                            </label>
+                        </div>
+                        <div class="form-group">
+                            <label class="form-label">{{ _('auto_backup_interval_label') }}</label>
+                            <select class="form-select" name="interval_hours" id="autoBackupInterval">
+                                {% set auto_backup_interval = settings.get('auto_backup', {}).get('interval_hours', 24) | int %}
+                                {% for hour in range(1, 25) %}
+                                <option value="{{ hour }}" {% if auto_backup_interval == hour %}selected{% endif %}>{{ hour }} {{ _('hours_suffix') }}</option>
+                                {% endfor %}
+                            </select>
+                        </div>
+                    </form>
+                    <p class="form-hint">{{ _('auto_backup_hint') }}</p>
+                    {% if settings.auto_backup.last_run_at %}
+                    <div class="form-hint" style="margin-top: var(--space-xs);">
+                        {{ _('auto_backup_last_run') }}: {{ settings.auto_backup.last_run_at }} ·
+                        {{ _('auto_backup_last_status') }}: {{ settings.auto_backup.last_status or '-' }} ·
+                        {{ _('auto_backup_created_count') }}: {{ settings.auto_backup.last_created_count or 0 }}
+                    </div>
+                    {% endif %}
+                    {% if settings.auto_backup.last_error %}
+                    <div class="form-hint" style="margin-top: var(--space-xs); color: var(--danger);">
+                        {{ settings.auto_backup.last_error }}
+                    </div>
+                    {% endif %}
                 </div>
             </div>
             <p class="form-hint" style="margin-top: var(--space-sm);">
@@ -540,8 +594,73 @@
             if (data.local_server) document.getElementById('localServerUrl').textContent = data.local_server;
             updateTunnelProvider('cloudflare', data.cloudflare || {});
             updateTunnelProvider('ngrok', data.ngrok || {});
+            updateWarpStatus(data.warp || {});
         } catch (err) {
             showToast(`${_('error')}: ` + err.message, 'error');
+        }
+    }
+
+    function updateWarpStatus(status) {
+        const badge = document.getElementById('warpInstallBadge');
+        const statusText = document.getElementById('warpStatusText');
+        const hintText = document.getElementById('warpHintText');
+        const connectBtn = document.getElementById('warpConnectBtn');
+        const disconnectBtn = document.getElementById('warpDisconnectBtn');
+        const connectText = document.getElementById('warpConnectBtnText');
+        if (!badge || !statusText || !connectBtn || !disconnectBtn || !connectText) return;
+
+        const installed = !!status.installed;
+        const connected = !!status.connected || status.status === 'connected';
+        badge.className = connected ? 'badge badge-success' : (installed ? 'badge badge-info' : 'badge badge-secondary');
+        badge.textContent = connected ? _('warp_connected') : (installed ? _('installed') : _('not_installed'));
+
+        const statusKey = `warp_status_${status.status || 'unknown'}`;
+        statusText.textContent = _(statusKey) || status.status || _('warp_status_unknown');
+        hintText.textContent = status.last_error || (installed ? _('warp_hint') : (status.install_hint || _('warp_install_hint')));
+        connectText.textContent = installed ? _('warp_connect') : _('warp_install_required');
+        connectBtn.disabled = connected;
+        disconnectBtn.classList.toggle('hidden', !connected);
+    }
+
+    async function connectWarp() {
+        const btn = document.getElementById('warpConnectBtn');
+        const spinner = document.getElementById('warpConnectSpinner');
+        const text = document.getElementById('warpConnectBtnText');
+        btn.disabled = true;
+        spinner.classList.remove('hidden');
+        text.textContent = _('loading');
+
+        try {
+            const status = await apiCall('/api/settings/warp/connect', 'POST');
+            updateWarpStatus(status);
+            showToast(_('warp_connected'), 'success');
+        } catch (err) {
+            showToast(`${_('error')}: ` + err.message, 'error');
+            await loadTunnelStatus();
+        } finally {
+            spinner.classList.add('hidden');
+        }
+    }
+
+    async function disconnectWarp() {
+        const btn = document.getElementById('warpDisconnectBtn');
+        const spinner = document.getElementById('warpDisconnectSpinner');
+        const text = document.getElementById('warpDisconnectBtnText');
+        btn.disabled = true;
+        spinner.classList.remove('hidden');
+        text.textContent = _('loading');
+
+        try {
+            const status = await apiCall('/api/settings/warp/disconnect', 'POST');
+            updateWarpStatus(status);
+            showToast(_('warp_disconnected'), 'success');
+        } catch (err) {
+            showToast(`${_('error')}: ` + err.message, 'error');
+            await loadTunnelStatus();
+        } finally {
+            btn.disabled = false;
+            text.textContent = _('warp_disconnect');
+            spinner.classList.add('hidden');
         }
     }
 
@@ -720,11 +839,17 @@
             panel_port: parseInt(document.getElementById('panel_port').value || '5000')
         };
 
+        const autoBackupForm = document.getElementById('autoBackupForm');
+        const auto_backup = {
+            enabled: autoBackupForm.enabled.checked,
+            interval_hours: parseInt(autoBackupForm.interval_hours.value || '24')
+        };
+
         try {
             const res = await fetch('/api/settings/save', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ appearance, sync, captcha, telegram, ssl })
+                body: JSON.stringify({ appearance, sync, captcha, telegram, ssl, auto_backup })
             });
             if (!res.ok) throw new Error(_('error'));
             showToast(_('settings_saved'), 'success');
