@@ -1,37 +1,46 @@
-# Virtual Environment
-venv/
-env/
-.venv/
-
-# PyInstaller folders
-build/
-dist/
-*.spec
-
-# Python
+```
+# Compiled Python files
 __pycache__/
 *.pyc
-*.pyo
-*.pyd
-.Python
-env/
-pip-log.txt
-pip-delete-this-directory.txt
-.tox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
+
+# Database files
+*.db
+
+# Environment files
+.env
+.env.local
+*.env.*
+
+# Dependencies
+node_modules/
+.venv/
+venv/
+pip-tools/
+
+# Logs and temporary files
 *.log
-.pytest_cache/
-.mypy_cache/
+*.tmp
+*.swp
 
-# User data
-data.json
-.DS_Store
-
-# IDEs
+# Editors
 .vscode/
 .idea/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Coverage reports
+.coverage
+htmlcov/
+coverage/
+
+# Distribution / build artifacts
+dist/
+build/
+target/
+*.egg-info/
+
+# Docker
+.dockerignore
+```
